@@ -5,6 +5,7 @@ import { isBuiltin } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { CLI_OAUTH_FLOWS, cliProviderProfilePlugin } from "./coding-agent-bundle-profile.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
@@ -15,38 +16,25 @@ const bundleDir = join(codingAgentDistDir, "bundle");
 const banner = {
 	js: 'import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);',
 };
-const allowedExternalPackages = new Set([
+const nativeExternalPackages = [
 	"@silvia-odwyer/photon-node",
-	"jiti",
 	// Optional native accelerators. Their callers fall back to JavaScript when absent.
 	"bufferutil",
 	"utf-8-validate",
 	// Optional native proxy authentication. Its caller reports an install hint when absent.
 	"kerberos",
+];
+const allowedExternalPackages = new Set([
+	...nativeExternalPackages,
 	// Optional debug output coloring.
 	"supports-color",
 ]);
 
-const lazyJitiPlugin = {
-	name: "lazy-jiti-transform",
+const bundledJitiPlugin = {
+	name: "bundled-jiti-transform",
 	setup(build) {
-		build.onResolve({ filter: /^jiti\/static$/ }, () => ({
-			namespace: "lazy-jiti",
-			path: "jiti/static",
-		}));
-		build.onLoad({ filter: /.*/, namespace: "lazy-jiti" }, () => ({
-			contents: `
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
-let createJitiImpl;
-
-export function createJiti(...args) {
-	createJitiImpl ??= require("jiti").createJiti;
-	return createJitiImpl(...args);
-}
-`,
-			loader: "js",
+		build.onResolve({ filter: /^jiti$/ }, () => ({
+			path: fileURLToPath(import.meta.resolve("jiti/static")),
 		}));
 	},
 };
@@ -81,7 +69,7 @@ function commonBuildOptions() {
 		banner,
 		bundle: true,
 		define: { PI_BUNDLED_NODE: "true" },
-		external: ["@silvia-odwyer/photon-node"],
+		external: nativeExternalPackages,
 		format: "esm",
 		legalComments: "none",
 		logLevel: "warning",
@@ -89,11 +77,9 @@ function commonBuildOptions() {
 		minifySyntax: true,
 		minifyWhitespace: true,
 		platform: "node",
-		// The source uses jiti/static so Bun embeds its Babel transform. The Node
-		// package replaces it with a synchronous lazy require so jiti loads only
-		// when importing an extension; Babel remains deferred until a cache miss
-		// needs transformation.
-		plugins: [lazyJitiPlugin, httpsProxyAgentNamedExportPlugin],
+		// Both jiti entries use the static transform so Babel is included in the
+		// lazy extension-loader chunk rather than required from node_modules.
+		plugins: [cliProviderProfilePlugin(repoRoot), bundledJitiPlugin, httpsProxyAgentNamedExportPlugin],
 		sourcemap: false,
 		target: "node22.19",
 		// Do not apply the monorepo's source-oriented path aliases while bundling
@@ -143,8 +129,8 @@ for (const entry of [
 	join(codingAgentDistDir, "rpc-entry.js"),
 	join(codingAgentDistDir, "utils", "image-resize-worker.js"),
 	join(codingAgentDistDir, "extensions", "codemode", "worker.js"),
-	join(aiDistDir, "api", "bedrock-converse-stream.js"),
-	join(aiDistDir, "auth", "oauth", "anthropic.js"),
+	join(aiDistDir, "auth", "oauth", "github-copilot.js"),
+	join(aiDistDir, "auth", "oauth", "openai-codex.js"),
 ]) {
 	if (!existsSync(entry)) {
 		throw new Error(`Bundle input is missing: ${relative(repoRoot, entry)}. Build the workspace packages first.`);
@@ -167,45 +153,23 @@ const mainResult = await build({
 	splitting: true,
 });
 
-const bedrockLoaderOutput = findContainingOutput(mainResult.metafile, "packages/ai/dist/api/bedrock-converse-stream.lazy.js");
 const oauthLoaderOutput = findContainingOutput(mainResult.metafile, "packages/ai/dist/auth/oauth/load.js");
 const imageResizeOutput = findContainingOutput(mainResult.metafile, "packages/coding-agent/dist/utils/image-resize.js");
 const configOutput = findContainingOutput(mainResult.metafile, "packages/coding-agent/dist/config.js");
-if (dirname(bedrockLoaderOutput) !== dirname(oauthLoaderOutput)) {
-	throw new Error("Bedrock and OAuth lazy loaders were emitted into different directories");
-}
 
 // These implementations are reached through variable-specifier imports or a
 // worker URL, so the main bundle cannot follow them. Emit one self-contained
 // file per implementation beside the code that resolves it.
 const lazyEntryPoints = {
-	anthropic: join(aiDistDir, "auth", "oauth", "anthropic.js"),
-	"bedrock-converse-stream": join(aiDistDir, "api", "bedrock-converse-stream.js"),
-	"github-copilot": join(aiDistDir, "auth", "oauth", "github-copilot.js"),
+	...Object.fromEntries(CLI_OAUTH_FLOWS.map((flow) => [flow, join(aiDistDir, "auth", "oauth", `${flow}.js`)])),
 	"image-resize-worker": join(codingAgentDistDir, "utils", "image-resize-worker.js"),
-	"kimi-coding": join(aiDistDir, "auth", "oauth", "kimi-coding.js"),
-	meta: join(aiDistDir, "auth", "oauth", "meta.js"),
-	"openai-chatgpt": join(aiDistDir, "auth", "oauth", "openai-chatgpt.js"),
-	"openai-codex": join(aiDistDir, "auth", "oauth", "openai-codex.js"),
-	openrouter: join(aiDistDir, "auth", "oauth", "openrouter.js"),
-	radius: join(aiDistDir, "auth", "oauth", "radius.js"),
-	xai: join(aiDistDir, "auth", "oauth", "xai.js"),
 };
-
-// Every OAuth flow loaded through importOAuthModule() must have a lazy entry,
-// otherwise the flow fails at runtime with a missing module error.
-const oauthLoadSource = readFileSync(join(repoRoot, "packages", "ai", "src", "auth", "oauth", "load.ts"), "utf8");
-for (const match of oauthLoadSource.matchAll(/importOAuthModule\("\.\/([^"]+)\.ts"\)/g)) {
-	if (!(match[1] in lazyEntryPoints)) {
-		throw new Error(`OAuth flow "${match[1]}" is lazily imported but has no lazy bundle entry`);
-	}
-}
 
 const lazyResult = await build({
 	...commonBuildOptions(),
 	entryNames: "[name]",
 	entryPoints: lazyEntryPoints,
-	outdir: dirname(bedrockLoaderOutput),
+	outdir: dirname(oauthLoaderOutput),
 	splitting: false,
 });
 
@@ -218,7 +182,7 @@ const codemodeWorkerResult = await build({
 	banner: undefined,
 	entryNames: "[name]",
 	entryPoints: { "codemode-worker": join(codingAgentDistDir, "extensions", "codemode", "worker.js") },
-	outdir: dirname(bedrockLoaderOutput),
+	outdir: dirname(oauthLoaderOutput),
 	splitting: false,
 });
 for (const [outputPath, output] of Object.entries(codemodeWorkerResult.metafile.outputs)) {
@@ -233,12 +197,12 @@ for (const [outputPath, output] of Object.entries(codemodeWorkerResult.metafile.
 	}
 }
 
-const imageResizeWorkerOutput = resolve(dirname(bedrockLoaderOutput), "image-resize-worker.js");
+const imageResizeWorkerOutput = resolve(dirname(oauthLoaderOutput), "image-resize-worker.js");
 if (dirname(imageResizeOutput) !== dirname(imageResizeWorkerOutput)) {
 	throw new Error("Image resize implementation and worker were emitted into different directories");
 }
 // getCodemodeWorkerUrl() in config.ts resolves the worker next to its own chunk.
-if (dirname(configOutput) !== dirname(bedrockLoaderOutput)) {
+if (dirname(configOutput) !== dirname(oauthLoaderOutput)) {
 	throw new Error("config.ts and the codemode worker were emitted into different directories");
 }
 
